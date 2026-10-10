@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -178,10 +180,100 @@ func (g *Gemini) process(ctx context.Context, userText string) (AIResult, error)
 	return result, nil
 }
 
+
+func (t *Telegram) sendPhoto(ctx context.Context, chatID int64, photoURL, caption string) error {
+	if len([]rune(caption)) > 1000 {
+		caption = string([]rune(caption)[:997]) + "..."
+	}
+	return t.call(ctx, "sendPhoto", map[string]any{
+		"chat_id": chatID,
+		"photo": photoURL,
+		"caption": caption,
+		"parse_mode": "HTML",
+	}, nil)
+}
+
+type NASAAPOD struct {
+	Title       string `json:"title"`
+	Explanation string `json:"explanation"`
+	URL         string `json:"url"`
+	HDURL       string `json:"hdurl"`
+	MediaType   string `json:"media_type"`
+	Date        string `json:"date"`
+}
+
+func (t *Telegram) sendNASAAPOD(ctx context.Context, chatID int64) {
+	apiKey := strings.TrimSpace(os.Getenv("NASA_API_KEY"))
+	if apiKey == "" {
+		apiKey = "DEMO_KEY"
+	}
+	endpoint := "https://api.nasa.gov/planetary/apod?api_key=" + url.QueryEscape(apiKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		_ = t.send(ctx, chatID, "❌ Der NASA-Dienst ist aktuell nicht erreichbar.")
+		return
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("NASA APOD request failed: %v", err)
+		_ = t.send(ctx, chatID, "❌ Der NASA-Dienst ist aktuell nicht erreichbar. Bitte versuche es später erneut.")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("NASA APOD returned HTTP %d", resp.StatusCode)
+		_ = t.send(ctx, chatID, "🌌 Die NASA-Tagesbild-Schnittstelle ist gerade ausgelastet. Du kannst das Bild direkt auf https://apod.nasa.gov/apod/astropix.html ansehen.")
+		return
+	}
+	var apod NASAAPOD
+	if err := json.NewDecoder(resp.Body).Decode(&apod); err != nil {
+		log.Printf("NASA APOD response decode failed: %v", err)
+		_ = t.send(ctx, chatID, "❌ Die NASA hat eine ungültige Antwort geliefert. Bitte versuche es später erneut.")
+		return
+	}
+	title := strings.TrimSpace(apod.Title)
+	if title == "" {
+		title = "NASA Bild des Tages"
+	}
+	explanation := strings.TrimSpace(apod.Explanation)
+	if explanation == "" {
+		explanation = "Keine Beschreibung verfügbar."
+	}
+	runes := []rune(explanation)
+	if len(runes) > 400 {
+		explanation = string(runes[:400]) + "…"
+	}
+	caption := fmt.Sprintf("🌌 <b>NASA Bild des Tages: %s</b>\n\n%s\n\n📅 %s",
+		html.EscapeString(title), html.EscapeString(explanation), html.EscapeString(apod.Date))
+	if apod.MediaType == "image" && strings.TrimSpace(apod.URL) != "" {
+		if err := t.sendPhoto(ctx, chatID, apod.URL, caption); err != nil {
+			log.Printf("Sending NASA APOD photo failed: %v", err)
+			fallback := caption + "\n\n" + html.EscapeString(apod.URL)
+			_ = t.send(ctx, chatID, strings.ReplaceAll(strings.ReplaceAll(fallback, "<b>", ""), "</b>", ""))
+		}
+		return
+	}
+	if apod.MediaType == "video" && strings.TrimSpace(apod.URL) != "" {
+		caption += "\n\n🎥 Heute gibt es ein Video statt eines Bildes: " + html.EscapeString(apod.URL)
+	} else if strings.TrimSpace(apod.URL) != "" {
+		caption += "\n\nMehr dazu: " + html.EscapeString(apod.URL)
+	}
+	// sendMessage does not enable HTML parsing, so remove markup from the text fallback.
+	caption = strings.ReplaceAll(strings.ReplaceAll(caption, "<b>", ""), "</b>", "")
+	_ = t.send(ctx, chatID, caption)
+}
+
 func handleMessage(ctx context.Context, tg *Telegram, ai *Gemini, cfg Config, msg Message) {
 	if msg.From == nil || msg.Text == "" { return }
 	text := strings.TrimSpace(msg.Text)
 	if text == "" { return }
+	if strings.HasPrefix(text, "/nasa") {
+		nasaCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		defer cancel()
+		tg.sendNASAAPOD(nasaCtx, msg.Chat.ID)
+		return
+	}
 	if strings.HasPrefix(text, "/start") {
 		_ = tg.send(ctx, msg.Chat.ID, "Hallo, ich bin Housebot. Schreib mir eine Frage oder erwähne mich in einer Gruppe.")
 		return
